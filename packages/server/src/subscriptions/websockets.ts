@@ -11,9 +11,10 @@ import type { RawData, WebSocket } from 'ws';
 import { getConfig } from '../config/loader';
 import { getRepoForLogin } from '../fhir/accesspolicy';
 import type { AdditionalWsBindingClaims } from '../fhir/operations/getwsbindingtoken';
-import type { CacheEntry } from '../fhir/repo';
+import type { CacheEntry, Repository } from '../fhir/repo';
 import { getFullUrl } from '../fhir/response';
 import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
+import { TODO_SHARD_ID } from '../fhir/sharding';
 import { DEFAULT_HEARTBEAT_MS, heartbeat } from '../heartbeat';
 import { globalLogger } from '../logger';
 import type { MedplumAccessTokenClaims } from '../oauth/keys';
@@ -51,6 +52,7 @@ export type SubscriptionClientMsg = BindWithTokenMsg | UnbindFromTokenMsg | { ty
 export interface WebSocketSubMetadata {
   rawToken: string;
   criteriaResourceType: ResourceType;
+  repo: Repository;
 }
 
 export type WebSocketSubToken = MedplumAccessTokenClaims & AdditionalWsBindingClaims;
@@ -67,15 +69,16 @@ const METRIC_OPTIONS = { attributes: { hostname } };
 const wsToSubLookup = new Map<WebSocket, Map<string, WebSocketSubMetadata>>();
 const subToWsLookup = new Map<string, Set<WebSocket>>();
 
-let redisSubscriber: Redis | undefined;
+const redisSubscribersByShardId = new Map<string, Redis>();
 let heartbeatHandler: (() => void) | undefined;
 
 let subscriptionEventsFired = 0;
 let subscriptionMessagesSent = 0;
 let subscriptionMessagesReceived = 0;
 
-async function setupSubscriptionHandler(): Promise<void> {
-  redisSubscriber = getPubSubRedisSubscriber();
+async function setupSubscriptionHandler(shardId: string): Promise<void> {
+  const redisSubscriber = getPubSubRedisSubscriber(shardId);
+  redisSubscribersByShardId.set(shardId, redisSubscriber);
   redisSubscriber.on('message', async (channel: string, events: string) => {
     globalLogger.debug('[WS] redis subscription events', { channel, events });
     const subEventPayload = JSON.parse(events) as V1SubEventPayload | V2SubEventPayload;
@@ -135,7 +138,7 @@ async function setupSubscriptionHandler(): Promise<void> {
         purgeSubscriptionFromLookups(subscriptionId);
       }
       try {
-        const redis = getCacheRedis();
+        const redis = getCacheRedis(shardId);
         const redisKeys = deadSubscriptionIds.map((id) => `Subscription/${id}`);
         const cacheEntries = await redis.mget(...redisKeys);
         const projectToSubsByResourceType = new Map<string, Map<ResourceType, string[]>>();
@@ -166,7 +169,7 @@ async function setupSubscriptionHandler(): Promise<void> {
               resourceType,
             });
           }
-          await markInMemorySubscriptionsInactive(projectId, subIdsByResourceType);
+          await markInMemorySubscriptionsInactive(shardId, projectId, subIdsByResourceType);
         }
       } catch (err) {
         globalLogger.error('[WS] Error marking dead subscriptions inactive', { err });
@@ -205,12 +208,7 @@ function ensureHeartbeatHandler(): void {
   }
 }
 
-function subscribeWsToSubscription(
-  ws: WebSocket,
-  subscriptionId: string,
-  rawToken: string,
-  criteriaResourceType: ResourceType
-): void {
+function subscribeWsToSubscription(ws: WebSocket, subscriptionId: string, wsSubMetadata: WebSocketSubMetadata): void {
   let wsSet = subToWsLookup.get(subscriptionId);
   let subEntryMap = wsToSubLookup.get(ws);
   if (!wsSet) {
@@ -222,7 +220,7 @@ function subscribeWsToSubscription(
     wsToSubLookup.set(ws, subEntryMap);
   }
   wsSet.add(ws);
-  subEntryMap.set(subscriptionId, { rawToken, criteriaResourceType });
+  subEntryMap.set(subscriptionId, wsSubMetadata);
 }
 
 function unsubscribeWsFromSubscription(ws: WebSocket, subscriptionId: string): void {
@@ -292,7 +290,6 @@ function unsubscribeWsFromAllSubscriptions(ws: WebSocket): void {
 // This seems like it is potentially error prone without ensured atomicity of Redis operations between server instances but I'm sure there are existing solutions for this
 
 export async function handleR4SubscriptionConnection(socket: WebSocket): Promise<void> {
-  const redis = getCacheRedis();
   const socketId = randomUUID();
   let onDisconnect: (() => Promise<void>) | undefined;
   let userRef: string | undefined;
@@ -335,10 +332,25 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
       return;
     }
 
-    if (!redisSubscriber) {
-      await setupSubscriptionHandler();
+    const authState = await getLoginForAccessToken(undefined, rawToken);
+    if (!authState) {
+      globalLogger.info('[WS] Unable to get login for the given access token', {
+        subscriptionId: verifiedToken.subscription_id,
+      });
+      return;
     }
-    const cacheEntryStr = await redis.get(`Subscription/${verifiedToken.subscription_id}`);
+    let repo: Repository;
+    try {
+      repo = await getRepoForLogin(authState);
+    } catch (err) {
+      globalLogger.error('[WS] Unable to get repo for the given access token', { err, authState });
+      return;
+    }
+
+    if (!redisSubscribersByShardId.get(repo.shardId)) {
+      await setupSubscriptionHandler(repo.shardId);
+    }
+    const cacheEntryStr = await getCacheRedis(repo.shardId).get(`Subscription/${verifiedToken.subscription_id}`);
     if (!cacheEntryStr) {
       globalLogger.warn('[WS] Failed to retrieve subscription cache entry when binding to token', {
         subscriptionId: verifiedToken.subscription_id,
@@ -366,15 +378,15 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
       }
       membershipId = membership.id;
     }
-    await addUserActiveWebSocketSubscription(verifiedToken.profile, subRef);
-    await setActiveSubscription(cacheEntry.projectId, criteriaResourceType, subRef, {
+    await addUserActiveWebSocketSubscription(repo.shardId, verifiedToken.profile, subRef);
+    await setActiveSubscription(repo.shardId, cacheEntry.projectId, criteriaResourceType, subRef, {
       criteria: cacheEntry.resource.criteria,
       expiration,
       author: verifiedToken.profile,
       loginId: verifiedToken.login_id,
       membershipId,
     });
-    subscribeWsToSubscription(socket, verifiedToken.subscription_id, rawToken, criteriaResourceType);
+    subscribeWsToSubscription(socket, verifiedToken.subscription_id, { rawToken, criteriaResourceType, repo });
     ensureHeartbeatHandler();
     if (!userRef) {
       userRef = verifiedToken.profile;
@@ -382,7 +394,7 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
     if (!socketProjectId) {
       socketProjectId = cacheEntry.projectId;
     }
-    const userSubCount = await getUserActiveWebSocketSubscriptionCount(verifiedToken.profile);
+    const userSubCount = await getUserActiveWebSocketSubscriptionCount(repo.shardId, verifiedToken.profile);
     globalLogger.info('[WS] Bound to subscription', {
       socketId,
       subscriptionId: verifiedToken.subscription_id,
@@ -410,7 +422,7 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
       }
       const subIdsByResourceType = getSubIdsByResourceType(subEntries);
       unsubscribeWsFromAllSubscriptions(socket);
-      await markInMemorySubscriptionsInactive(cacheEntry.projectId, subIdsByResourceType);
+      await markInMemorySubscriptionsInactive(repo.shardId, cacheEntry.projectId, subIdsByResourceType);
     };
   };
 
@@ -430,7 +442,7 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
     // Read metadata before unsubscribing, since unsubscribe removes it from the map
     const subMetadata = wsToSubLookup.get(socket)?.get(verifiedToken.subscription_id);
     unsubscribeWsFromSubscription(socket, verifiedToken.subscription_id);
-    const cacheEntryStr = await redis.get(`Subscription/${verifiedToken.subscription_id}`);
+    const cacheEntryStr = await getCacheRedis(TODO_SHARD_ID).get(`Subscription/${verifiedToken.subscription_id}`);
     if (!cacheEntryStr) {
       globalLogger.warn('[WS] Failed to retrieve subscription cache entry when unbinding from token', {
         subscriptionId: verifiedToken.subscription_id,
@@ -438,11 +450,11 @@ export async function handleR4SubscriptionConnection(socket: WebSocket): Promise
       return;
     }
     const cacheEntry = JSON.parse(cacheEntryStr) as CacheEntry<Subscription>;
-    const subIdsByResourceType = new Map<ResourceType, string[]>();
     if (subMetadata) {
+      const subIdsByResourceType = new Map<ResourceType, string[]>();
       subIdsByResourceType.set(subMetadata.criteriaResourceType, [verifiedToken.subscription_id]);
+      await markInMemorySubscriptionsInactive(subMetadata.repo.shardId, cacheEntry.projectId, subIdsByResourceType);
     }
-    await markInMemorySubscriptionsInactive(cacheEntry.projectId, subIdsByResourceType);
   };
 
   socket.on('message', async (data: RawData) => {
@@ -591,13 +603,14 @@ export function getSubIdsByResourceType(
   return byResourceType;
 }
 
-export async function markInMemorySubscriptionsInactive(
+async function markInMemorySubscriptionsInactive(
+  shardId: string,
   projectId: string,
   subIdsByResourceType: Map<ResourceType, string[]>
 ): Promise<void> {
   let cacheRedis: Redis | undefined;
   try {
-    cacheRedis = getCacheRedis();
+    cacheRedis = getCacheRedis(shardId);
   } catch {
     cacheRedis = undefined;
     globalLogger.debug('Attempted to mark subscriptions as inactive when Redis is closed');
@@ -618,7 +631,7 @@ export async function markInMemorySubscriptionsInactive(
   // Remove from project-level active hashes
   for (const [resourceType, refs] of refsByResourceType) {
     try {
-      await removeActiveSubscriptions(projectId, resourceType, refs);
+      await removeActiveSubscriptions(shardId, projectId, resourceType, refs);
     } catch {
       globalLogger.debug('Attempted to mark subscriptions as inactive when Redis is closed');
       return;
@@ -663,7 +676,7 @@ export async function markInMemorySubscriptionsInactive(
   if (authorToRefs) {
     for (const [author, authorRefs] of authorToRefs) {
       try {
-        await removeUserActiveWebSocketSubscriptions(author, authorRefs);
+        await removeUserActiveWebSocketSubscriptions(shardId, author, authorRefs);
       } catch {
         globalLogger.debug('Attempted to remove user subscription tracking when Redis is closed');
       }
@@ -671,12 +684,16 @@ export async function markInMemorySubscriptionsInactive(
   }
 }
 
-export async function checkWebSocketSubscriptionLimit(project: WithId<Project>, authorRef: string): Promise<void> {
+export async function checkWebSocketSubscriptionLimit(
+  shardId: string,
+  project: WithId<Project>,
+  authorRef: string
+): Promise<void> {
   const maxUserWsSubs =
     project.systemSetting?.find((setting) => setting.name === 'maxUserWebSocketSubscriptions')?.valueInteger ??
     // We know this is defined in defaults so this is safe to cast
     (getConfig().defaultMaxUserWebSocketSubscriptions as number);
-  const userSubCount = await getUserActiveWebSocketSubscriptionCount(authorRef);
+  const userSubCount = await getUserActiveWebSocketSubscriptionCount(shardId, authorRef);
   if (userSubCount >= maxUserWsSubs) {
     throw new OperationOutcomeError(
       badRequest(`User has exceeded allotted maximum number of concurrent WebSocket subscriptions: ${maxUserWsSubs}`)

@@ -54,6 +54,7 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
 
   const remoteAddress = request.socket.remoteAddress;
   let agentId: string | undefined = undefined;
+  let agentShardId: string | undefined = undefined;
 
   // Create a redis client for this connection.
   // According to Redis documentation: http://redis.io/commands/subscribe
@@ -94,14 +95,14 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
           case 'agent:reloadconfig:response':
           case 'agent:upgrade:response':
           case 'agent:logs:response':
-            if (command.callback) {
-              await publish(command.callback, JSON.stringify(command));
+            if (agentShardId && command.callback) {
+              await publish(agentShardId, command.callback, JSON.stringify(command));
             }
             break;
 
           case 'agent:error':
-            if (command.callback) {
-              await publish(command.callback, JSON.stringify(command));
+            if (agentShardId && command.callback) {
+              await publish(agentShardId, command.callback, JSON.stringify(command));
             }
             globalLogger.error('[Agent]: Error received from agent', { error: command.body });
             break;
@@ -124,6 +125,7 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
       redisSubscriber?.disconnect();
       redisSubscriber = undefined;
       agentId = undefined;
+      agentShardId = undefined;
     })
   );
 
@@ -151,12 +153,13 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
       sendError('Invalid access token');
       return;
     }
+    agentShardId = authState.projectShardId;
 
     const repo = await getRepoForLogin(authState, true);
     const agent = await repo.readResource<Agent>('Agent', agentId);
 
     // Connect to Redis
-    redisSubscriber = getPubSubRedisSubscriber();
+    redisSubscriber = getPubSubRedisSubscriber(repo.shardId);
     await redisSubscriber.subscribe(getReferenceString(agent));
     redisSubscriber.on('message', (_channel: string, message: string) => {
       // When a message is received, send it to the agent
@@ -274,9 +277,13 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
       // Not connected
     }
 
+    if (!agentShardId) {
+      return;
+    }
+
     let redis: Redis;
     try {
-      redis = getCacheRedis();
+      redis = getCacheRedis(agentShardId);
     } catch (err) {
       globalLogger.warn(`[Agent]: Attempted to update agent info after server closed. ${normalizeErrorString(err)}`);
       return;
@@ -298,9 +305,13 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
       // Not connected
     }
 
+    if (!agentShardId) {
+      return;
+    }
+
     let redis: Redis;
     try {
-      redis = getCacheRedis();
+      redis = getCacheRedis(agentShardId);
     } catch (err) {
       globalLogger.warn(`[Agent]: Attempted to update agent status after server closed. ${normalizeErrorString(err)}`);
       return;

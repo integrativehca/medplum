@@ -4,11 +4,11 @@ import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import type { SearchRequest, WithId } from '@medplum/core';
 import {
   ContentType,
-  LogLevel,
-  Operator,
   createReference,
   generateId,
   getReferenceString,
+  LogLevel,
+  Operator,
   stringify,
 } from '@medplum/core';
 import type {
@@ -38,7 +38,7 @@ import { loadTestConfig } from '../config/loader';
 import type { MedplumServerConfig } from '../config/types';
 import { tryGetRequestContext } from '../context';
 import type { SystemRepository } from '../fhir/repo';
-import { Repository } from '../fhir/repo';
+import { getShardSystemRepo, Repository } from '../fhir/repo';
 import * as loggerModule from '../logger';
 import { globalLogger } from '../logger';
 import * as otelModule from '../otel/otel';
@@ -79,7 +79,11 @@ describe('Subscription Worker', () => {
     (fetch as unknown as jest.Mock).mockClear();
 
     // Create one simple project with no advanced features enabled
-    const { client, repo: _repo } = await withTestContext(() =>
+    const {
+      client,
+      repo: _repo,
+      projectShardId,
+    } = await withTestContext(() =>
       createTestProject({
         withClient: true,
         withRepo: true,
@@ -91,12 +95,18 @@ describe('Subscription Worker', () => {
     );
 
     repo = _repo;
-    systemRepo = repo.getSystemRepo();
-    superAdminRepo = new Repository({ extendedMode: true, superAdmin: true, author: createReference(client) });
+    systemRepo = getShardSystemRepo(projectShardId);
+    superAdminRepo = new Repository({
+      projectShardId,
+      extendedMode: true,
+      superAdmin: true,
+      author: createReference(client),
+    });
 
     // Create another project, this one with bots enabled
     const botProjectDetails = await createTestProject({ withClient: true });
     botRepo = new Repository({
+      projectShardId,
       extendedMode: true,
       projects: [botProjectDetails.project],
       author: createReference(botProjectDetails.client),
@@ -2109,7 +2119,7 @@ describe('Subscription Worker', () => {
     let resolveExpectedFullMessage: ((message: WsSubMessage) => void) | undefined;
 
     beforeAll(async () => {
-      subscriber = getPubSubRedisSubscriber();
+      subscriber = getPubSubRedisSubscriber(repo.shardId);
       subscriber.on('message', (_channel, payload) => {
         const parsed = JSON.parse(payload) as WsSubMessage;
         if (resolveExpectedFullMessage) {
@@ -2197,18 +2207,23 @@ describe('Subscription Worker', () => {
      * pubsub active subscriptions hash.  In production this happens inside
      * `onBind` in websockets.ts; here we call the Redis helpers directly so
      * that the subscription worker can find the entry when evaluating criteria.
+     * @param repo - The repository to use.
      * @param subscription - The Subscription to simulate binding to.
      * @param projectId - The project ID the Subscription belongs to.
      * @returns A Promise that resolves to the reference string of the author.
      */
-    async function bindSubscription(subscription: WithId<Subscription>, projectId: string): Promise<string> {
+    async function bindSubscription(
+      repo: Repository,
+      subscription: WithId<Subscription>,
+      projectId: string
+    ): Promise<string> {
       const authorRef = subscription.meta?.author?.reference ?? 'Practitioner/test-author';
       const criteria = subscription.criteria ?? '*';
       const criteriaResourceType = criteria.split('?')[0] as ResourceType;
       const subRef = `Subscription/${subscription.id}`;
       const expiration = Math.floor(Date.now() / 1000) + 3600;
-      await addUserActiveWebSocketSubscription(authorRef, subRef);
-      await setActiveSubscription(projectId, criteriaResourceType, subRef, {
+      await addUserActiveWebSocketSubscription(repo.shardId, authorRef, subRef);
+      await setActiveSubscription(repo.shardId, projectId, criteriaResourceType, subRef, {
         criteria,
         expiration,
         author: authorRef,
@@ -2237,7 +2252,7 @@ describe('Subscription Worker', () => {
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
 
-        await bindSubscription(subscription, wsProject.id);
+        await bindSubscription(wsSubRepo, subscription, wsProject.id);
 
         let nextArgsPromise = waitForNextSubNotification<Patient>();
         const patient = await wsSubRepo.createResource<Patient>({
@@ -2370,6 +2385,7 @@ describe('Subscription Worker', () => {
           requestId: ctx?.requestId,
           traceId: ctx?.traceId,
           authState: ctx?.authState,
+          shardId: repo.shardId,
         };
 
         // For a websocket subscription, this results in "not found" instead of "gone"
@@ -2417,7 +2433,7 @@ describe('Subscription Worker', () => {
         });
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
-        await bindSubscription(subscription, project.id);
+        await bindSubscription(noWsSubRepo, subscription, project.id);
 
         const assertPromise = assertNoWsNotifications();
 
@@ -2475,7 +2491,7 @@ describe('Subscription Worker', () => {
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
 
-        await bindSubscription(subscription, project.id);
+        await bindSubscription(wsRepo, subscription, project.id);
 
         const assertPromise = assertNoWsNotifications();
 
@@ -2541,7 +2557,7 @@ describe('Subscription Worker', () => {
           channel: { type: 'websocket' },
         });
         expect(wsSub.id).toBeDefined();
-        await bindSubscription(wsSub, testProject.id);
+        await bindSubscription(testRepo, wsSub, testProject.id);
 
         const queue = getSubscriptionQueue() as any;
         queue.add.mockClear();
@@ -2606,7 +2622,7 @@ describe('Subscription Worker', () => {
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
 
-        await bindSubscription(subscription, project.id);
+        await bindSubscription(wsRepo, subscription, project.id);
 
         await superAdminRepo.deleteResource('ProjectMembership', membership.id);
 
@@ -2669,7 +2685,7 @@ describe('Subscription Worker', () => {
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
 
-        await bindSubscription(subscription, project.id);
+        await bindSubscription(wsRepo, subscription, project.id);
 
         await superAdminRepo.deleteResource('AccessPolicy', accessPolicy.id);
 
@@ -2711,12 +2727,12 @@ describe('Subscription Worker', () => {
         expect(subscription).toBeDefined();
 
         // The hash should be empty until a client binds via WebSocket
-        const preBindSubs = await getActiveSubscriptions(wsProject.id, 'Patient');
+        const preBindSubs = await getActiveSubscriptions(wsSubRepo.shardId, wsProject.id, 'Patient');
         expect(preBindSubs[`Subscription/${subscription.id}`]).toBeUndefined();
 
-        await bindSubscription(subscription, wsProject.id);
+        await bindSubscription(wsSubRepo, subscription, wsProject.id);
 
-        const activeSubs = await getActiveSubscriptions(wsProject.id, 'Patient');
+        const activeSubs = await getActiveSubscriptions(wsSubRepo.shardId, wsProject.id, 'Patient');
         expect(activeSubs[`Subscription/${subscription.id}`]).toMatchObject({
           criteria: 'Patient?name=Alice',
           expiration: expect.any(Number),
@@ -2742,7 +2758,11 @@ describe('Subscription Worker', () => {
         });
         expect(subscription).toBeDefined();
 
-        const activeSubs = await getActiveSubscriptions(wsProject.id, 'FakeResourceType' as ResourceType);
+        const activeSubs = await getActiveSubscriptions(
+          wsSubRepo.shardId,
+          wsProject.id,
+          'FakeResourceType' as ResourceType
+        );
         expect(activeSubs[`Subscription/${subscription.id}`]).toBeUndefined();
       }));
 
@@ -2764,7 +2784,7 @@ describe('Subscription Worker', () => {
           },
         });
         expect(observationSub).toBeDefined();
-        await bindSubscription(observationSub, wsProject.id);
+        await bindSubscription(wsSubRepo, observationSub, wsProject.id);
 
         // Create a subscription watching Patient
         const patientSub = await wsSubRepo.createResource<Subscription>({
@@ -2777,7 +2797,7 @@ describe('Subscription Worker', () => {
           },
         });
         expect(patientSub).toBeDefined();
-        await bindSubscription(patientSub, wsProject.id);
+        await bindSubscription(wsSubRepo, patientSub, wsProject.id);
 
         // Creating a Patient should only trigger the Patient subscription, not the Observation one
         const nextArgsPromise = waitForNextSubNotification<Patient>();
@@ -2855,7 +2875,7 @@ describe('Subscription Worker', () => {
 
         expect(subscription).toBeDefined();
         expect(subscription.id).toBeDefined();
-        await bindSubscription(subscription, wsProject.id);
+        await bindSubscription(wsSubRepo, subscription, wsProject.id);
 
         const nextArgsPromise = waitForNextSubNotification<Patient>();
         const patient = await wsSubRepo.createResource<Patient>({
@@ -2901,7 +2921,7 @@ describe('Subscription Worker', () => {
           criteria,
           channel: { type: 'websocket' },
         });
-        await bindSubscription(sub1, wsProject.id);
+        await bindSubscription(wsSubRepo, sub1, wsProject.id);
 
         const sub2 = await wsSubRepo.createResource<Subscription>({
           resourceType: 'Subscription',
@@ -2910,7 +2930,7 @@ describe('Subscription Worker', () => {
           criteria,
           channel: { type: 'websocket' },
         });
-        await bindSubscription(sub2, wsProject.id);
+        await bindSubscription(wsSubRepo, sub2, wsProject.id);
 
         const sub3 = await wsSubRepo.createResource<Subscription>({
           resourceType: 'Subscription',
@@ -2919,7 +2939,7 @@ describe('Subscription Worker', () => {
           criteria,
           channel: { type: 'websocket' },
         });
-        await bindSubscription(sub3, wsProject.id);
+        await bindSubscription(wsSubRepo, sub3, wsProject.id);
 
         const nextMessagePromise = waitForNextSubMessage();
         const patient = await wsSubRepo.createResource<Patient>({
@@ -2992,7 +3012,7 @@ describe('Subscription Worker', () => {
           criteria: 'Patient?name=Alice',
           channel: { type: 'websocket' },
         });
-        await bindSubscription(aliceSub1, wsProject.id);
+        await bindSubscription(wsSubRepo, aliceSub1, wsProject.id);
 
         const aliceSub2 = await wsSubRepo.createResource<Subscription>({
           resourceType: 'Subscription',
@@ -3001,7 +3021,7 @@ describe('Subscription Worker', () => {
           criteria: 'Patient?name=Alice',
           channel: { type: 'websocket' },
         });
-        await bindSubscription(aliceSub2, wsProject.id);
+        await bindSubscription(wsSubRepo, aliceSub2, wsProject.id);
 
         // Two subscriptions with criteria that will NOT match
         const bobSub1 = await wsSubRepo.createResource<Subscription>({
@@ -3011,7 +3031,7 @@ describe('Subscription Worker', () => {
           criteria: 'Patient?name=Bob',
           channel: { type: 'websocket' },
         });
-        await bindSubscription(bobSub1, wsProject.id);
+        await bindSubscription(wsSubRepo, bobSub1, wsProject.id);
 
         const bobSub2 = await wsSubRepo.createResource<Subscription>({
           resourceType: 'Subscription',
@@ -3020,7 +3040,7 @@ describe('Subscription Worker', () => {
           criteria: 'Patient?name=Bob',
           channel: { type: 'websocket' },
         });
-        await bindSubscription(bobSub2, wsProject.id);
+        await bindSubscription(wsSubRepo, bobSub2, wsProject.id);
 
         const nextMessagePromise = waitForNextSubMessage();
         const patient = await wsSubRepo.createResource<Patient>({
@@ -3053,7 +3073,7 @@ describe('Subscription Worker', () => {
         });
 
         expect(subscription).toBeDefined();
-        await bindSubscription(subscription, wsProject.id);
+        await bindSubscription(wsSubRepo, subscription, wsProject.id);
 
         const mockInfo = jest.fn();
         const getLoggerSpy = jest.spyOn(loggerModule, 'getLogger').mockReturnValue({
@@ -3115,8 +3135,8 @@ describe('Subscription Worker', () => {
         const validSubRef = `Subscription/${validSub.id}`;
         const expiredSubRef = `Subscription/${expiredSub.id}`;
 
-        await addUserActiveWebSocketSubscription(authorRef, validSubRef);
-        await setActiveSubscription(wsProject.id, 'Patient', validSubRef, {
+        await addUserActiveWebSocketSubscription(wsSubRepo.shardId, authorRef, validSubRef);
+        await setActiveSubscription(wsSubRepo.shardId, wsProject.id, 'Patient', validSubRef, {
           criteria: 'Patient',
           expiration: futureExpiry,
           author: authorRef,
@@ -3124,8 +3144,8 @@ describe('Subscription Worker', () => {
           membershipId: randomUUID(),
         });
 
-        await addUserActiveWebSocketSubscription(authorRef, expiredSubRef);
-        await setActiveSubscription(wsProject.id, 'Patient', expiredSubRef, {
+        await addUserActiveWebSocketSubscription(wsSubRepo.shardId, authorRef, expiredSubRef);
+        await setActiveSubscription(wsSubRepo.shardId, wsProject.id, 'Patient', expiredSubRef, {
           criteria: 'Patient',
           expiration: pastExpiry,
           author: authorRef,
@@ -3134,7 +3154,7 @@ describe('Subscription Worker', () => {
         });
 
         // Both entries should be in the hash before the worker runs
-        const preCleanupSubs = await getActiveSubscriptions(wsProject.id, 'Patient');
+        const preCleanupSubs = await getActiveSubscriptions(wsSubRepo.shardId, wsProject.id, 'Patient');
         expect(preCleanupSubs[validSubRef]).toBeDefined();
         expect(preCleanupSubs[expiredSubRef]).toBeDefined();
 
@@ -3147,7 +3167,7 @@ describe('Subscription Worker', () => {
         await nextNotificationPromise;
 
         // The expired entry should have been cleaned from the hash
-        const postCleanupSubs = await getActiveSubscriptions(wsProject.id, 'Patient');
+        const postCleanupSubs = await getActiveSubscriptions(wsSubRepo.shardId, wsProject.id, 'Patient');
         expect(postCleanupSubs[expiredSubRef]).toBeUndefined();
         // The valid entry must still be present
         expect(postCleanupSubs[validSubRef]).toBeDefined();
@@ -3183,8 +3203,8 @@ describe('Subscription Worker', () => {
         const validSubRef = `Subscription/${validSub.id}`;
         const expiredSubRef = `Subscription/${expiredSub.id}`;
 
-        await addUserActiveWebSocketSubscription(authorRef, validSubRef);
-        await setActiveSubscription(wsProject.id, 'Patient', validSubRef, {
+        await addUserActiveWebSocketSubscription(wsSubRepo.shardId, authorRef, validSubRef);
+        await setActiveSubscription(wsSubRepo.shardId, wsProject.id, 'Patient', validSubRef, {
           criteria: 'Patient',
           expiration: futureExpiry,
           author: authorRef,
@@ -3192,8 +3212,8 @@ describe('Subscription Worker', () => {
           membershipId: randomUUID(),
         });
 
-        await addUserActiveWebSocketSubscription(authorRef, expiredSubRef);
-        await setActiveSubscription(wsProject.id, 'Patient', expiredSubRef, {
+        await addUserActiveWebSocketSubscription(wsSubRepo.shardId, authorRef, expiredSubRef);
+        await setActiveSubscription(wsSubRepo.shardId, wsProject.id, 'Patient', expiredSubRef, {
           criteria: 'Patient',
           expiration: pastExpiry,
           author: authorRef,
@@ -3201,7 +3221,7 @@ describe('Subscription Worker', () => {
           membershipId: randomUUID(),
         });
 
-        const countBefore = await getUserActiveWebSocketSubscriptionCount(authorRef);
+        const countBefore = await getUserActiveWebSocketSubscriptionCount(wsSubRepo.shardId, authorRef);
         expect(countBefore).toBe(2);
 
         // Trigger the worker; valid sub fires, expired is cleaned up
@@ -3213,7 +3233,7 @@ describe('Subscription Worker', () => {
         await nextNotificationPromise;
 
         // Expired entry should be removed from the user active set
-        const countAfter = await getUserActiveWebSocketSubscriptionCount(authorRef);
+        const countAfter = await getUserActiveWebSocketSubscriptionCount(wsSubRepo.shardId, authorRef);
         expect(countAfter).toBe(1);
       }));
 
@@ -3236,8 +3256,8 @@ describe('Subscription Worker', () => {
           channel: { type: 'websocket' },
         });
 
-        await addUserActiveWebSocketSubscription(authorRef, `Subscription/${expiredSub.id}`);
-        await setActiveSubscription(wsProject.id, 'Patient', `Subscription/${expiredSub.id}`, {
+        await addUserActiveWebSocketSubscription(wsSubRepo.shardId, authorRef, `Subscription/${expiredSub.id}`);
+        await setActiveSubscription(wsSubRepo.shardId, wsProject.id, 'Patient', `Subscription/${expiredSub.id}`, {
           criteria: 'Patient',
           expiration: pastExpiry,
           author: authorRef,
@@ -3254,7 +3274,7 @@ describe('Subscription Worker', () => {
         await assertPromise;
 
         // And the entry should be cleaned up from the hash
-        const activeSubs = await getActiveSubscriptions(wsProject.id, 'Patient');
+        const activeSubs = await getActiveSubscriptions(wsSubRepo.shardId, wsProject.id, 'Patient');
         expect(activeSubs[`Subscription/${expiredSub.id}`]).toBeUndefined();
       }));
   });

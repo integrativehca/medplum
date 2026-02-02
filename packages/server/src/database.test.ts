@@ -3,8 +3,15 @@
 import { deepClone, sleep } from '@medplum/core';
 import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
-import type { Pool, PoolClient, PoolConfig, QueryArrayResult, QueryConfig, QueryResult, QueryResultRow } from 'pg';
-import pg from 'pg';
+import type {
+  PoolClient,
+  PoolConfig,
+  PoolOptions,
+  QueryArrayResult,
+  QueryConfig,
+  QueryResult,
+  QueryResultRow,
+} from 'pg';
 import { Readable, Writable } from 'stream';
 import { loadConfig, loadTestConfig } from './config/loader';
 import type { MedplumDatabaseSslConfig } from './config/types';
@@ -17,15 +24,19 @@ import {
   initDatabase,
   releaseAdvisoryLock,
 } from './database';
+import { TEST_SHARD_ID } from './fhir/sharding';
 import { globalLogger } from './logger';
 import { GetDataVersionSql, GetVersionSql } from './migration-sql';
 import { getLatestPostDeployMigrationVersion, getPreDeployMigrationVersions } from './migrations/migration-versions';
+import * as shardPool from './sharding/shard-pool';
+import type { ShardPoolClient } from './sharding/sharding-types';
 
 const preDeployVersion = getPreDeployMigrationVersions().length;
 const latestVersion = getLatestPostDeployMigrationVersion();
 
 describe('Database config', () => {
-  let poolSpy: jest.SpyInstance<pg.Pool, [config?: pg.PoolConfig | undefined]>;
+  const shardId = TEST_SHARD_ID;
+  let poolSpy: jest.SpyInstance<shardPool.DefaultShardPool, [config: PoolConfig, shardId: string]>;
   let advisoryLockResponse = true;
 
   beforeAll(() => {
@@ -34,10 +45,12 @@ describe('Database config', () => {
       GetVersionSql,
       GetDataVersionSql,
     };
+    // jest.spyOn(console, 'log').mockImplementation(() => {});
     jest.useFakeTimers();
     jest.mock('pg');
-    poolSpy = jest.spyOn(pg, 'Pool').mockImplementation((_config?: PoolConfig) => {
-      class MockPoolClient extends Duplex implements PoolClient {
+    poolSpy = jest.spyOn(shardPool, 'DefaultShardPool').mockImplementation((config: PoolConfig, shardId: string) => {
+      class MockShardPoolClient extends Duplex implements ShardPoolClient {
+        shardId: string = shardId;
         release(): void {}
         async connect(): Promise<void> {}
         async query<R extends QueryResultRow = any, I = any[]>(sql: string | QueryConfig<I>): Promise<QueryResult<R>> {
@@ -80,14 +93,17 @@ describe('Database config', () => {
         setTypeParser(): void {}
       }
 
-      class MockPool extends EventEmitter implements Pool {
+      class MockDefaultShardPool extends EventEmitter implements shardPool.DefaultShardPool {
+        shardId: string;
+
         expiredCount: number;
         ending: boolean;
         ended: boolean;
-        options: pg.PoolOptions;
+        options: PoolOptions;
 
-        constructor(_config?: PoolConfig) {
+        constructor(_config: PoolConfig, _shardId: string) {
           super();
+          this.shardId = _shardId;
           this.expiredCount = 0;
           this.ending = false;
           this.ended = false;
@@ -103,8 +119,8 @@ describe('Database config', () => {
         totalCount = -1;
         idleCount = -1;
         waitingCount = -1;
-        async connect(): Promise<pg.PoolClient> {
-          return new MockPoolClient();
+        async connect(): Promise<ShardPoolClient> {
+          return new MockShardPoolClient();
         }
         on(): this {
           return this;
@@ -121,7 +137,7 @@ describe('Database config', () => {
         }
       }
 
-      return new MockPool();
+      return new MockDefaultShardPool(config, shardId);
     });
     jest.spyOn(globalLogger, 'error').mockImplementation(() => {});
   });
@@ -155,6 +171,7 @@ describe('Database config', () => {
     } satisfies MedplumDatabaseSslConfig;
     databaseConfig.ssl = sslConfig;
 
+    expect(poolSpy).toHaveBeenCalledTimes(0);
     await initDatabase(configCopy);
     expect(poolSpy).toHaveBeenCalledTimes(1);
     expect(poolSpy).toHaveBeenCalledWith(
@@ -165,7 +182,8 @@ describe('Database config', () => {
         database: databaseConfig.dbname,
         user: databaseConfig.username,
         ssl: sslConfig,
-      })
+      }),
+      shardId
     );
   });
 
@@ -190,7 +208,8 @@ describe('Database config', () => {
         database: databaseConfig.dbname,
         user: databaseConfig.username,
         ssl: { require: true },
-      })
+      }),
+      shardId
     );
   });
 
@@ -214,7 +233,8 @@ describe('Database config', () => {
     expect(poolSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         options: `-c statement_timeout=60000 -c default_transaction_isolation=repeatable\\ read -c idle_in_transaction_session_timeout=30000`,
-      })
+      }),
+      shardId
     );
   });
 
@@ -226,7 +246,8 @@ describe('Database config', () => {
     expect(poolSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         options: `-c statement_timeout=5000 -c default_transaction_isolation=repeatable\\ read -c idle_in_transaction_session_timeout=30000`,
-      })
+      }),
+      shardId
     );
   });
 
@@ -238,7 +259,8 @@ describe('Database config', () => {
     expect(poolSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         options: undefined,
-      })
+      }),
+      shardId
     );
   });
 
@@ -263,7 +285,7 @@ describe('Advisory locks', () => {
   beforeEach(async () => {
     const config = await loadTestConfig();
     await initDatabase(config);
-    const pool = getDatabasePool(DatabaseMode.READER);
+    const pool = getDatabasePool(DatabaseMode.READER, TEST_SHARD_ID);
     clientA = await pool.connect();
     clientB = await pool.connect();
     await clientA.query(`SET statement_timeout TO 100`);
