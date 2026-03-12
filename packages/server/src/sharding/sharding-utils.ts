@@ -19,6 +19,13 @@ export const GlobalResourceTypes = new Set([
   // 'SmartAppLaunch',
 ]);
 
+/**
+ * Resource types that live on per-project shards but must also be readable from the global shard
+ * for authN/authZ before the request's target shard is known.
+ * These are replicated from shards to global via the shard sync outbox.
+ */
+export const SyncedResourceTypes = new Set(['User', 'ProjectMembership', 'ClientApplication', 'SmartAppLaunch']);
+
 function getActiveShardId(project: GlobalProject): string | undefined {
   return project.shard?.[0]?.id;
 }

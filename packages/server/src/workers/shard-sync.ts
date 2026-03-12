@@ -1,9 +1,15 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
+import { OperationOutcomeError, sleep } from '@medplum/core';
 import type { Job, QueueBaseOptions } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
+import type { PoolClient } from 'pg';
+import { getConfig } from '../config/loader';
 import { tryGetRequestContext, tryRunInRequestContext } from '../context';
+import { DatabaseMode, getDatabasePool } from '../database';
+import { getGlobalSystemRepo } from '../fhir/repo';
 import { GLOBAL_SHARD_ID } from '../fhir/sharding';
+import { PostgresError } from '../fhir/sql';
 import { globalLogger } from '../logger';
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
 import { addVerboseQueueLogging, getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry } from './utils';
@@ -51,8 +57,17 @@ export const initShardSyncWorker: WorkerInitializer = (config, options?: WorkerI
   return { queue, worker, name: queueName };
 };
 
+interface ShardSyncStats {
+  processed: number;
+  skipped: number;
+  deleted: number;
+  errors: number;
+}
+
 /**
  * Executes a shard sync job.
+ * Drains the shard_sync_outbox table on the specified shard and replicates
+ * resources to the global shard.
  * @param job - The shard sync job details.
  */
 export async function execShardSyncJob(job: Job<ShardSyncJobData>): Promise<void> {
@@ -64,17 +79,208 @@ export async function execShardSyncJob(job: Job<ShardSyncJobData>): Promise<void
   }
   globalLogger.info('Executing shard sync job', { jobData: job.data });
 
-  // fetch the first N items from shard_sync_outbox ordering by id ascending.
-  // get the content of each resource from the shard. Can this be done in a single query/join between the shard_sync_outbox and the resources tables? It'd probably be ugly since there are multiple resource types.
-  // If the version is already the same on global, it should be a no-op that gets logged since that's unexpected.
-  // otherwise, update the resource content to the global shard. This should not trigger most (any?) background jobs that normally would be triggered by a resource update. Referential integrity shouldn't be enforced.
-  // delete the rows from shard_sync_outbox
-  // repeat until all items are processed with a configurable delay between chunks.
-  // Log the results
+  const config = getConfig().shardSync;
+  const batchSize = config?.batchSize ?? 100;
+  const maxIterations = config?.maxIterations ?? 1000;
+  const delayMs = config?.delayBetweenBatchesMs ?? 10;
+  const errorThreshold = config?.globalErrorThreshold ?? 3;
+  const maxAttempts = config?.maxAttempts ?? 10;
 
-  // Open questions:
-  // should a column be added to resource tables to distinguish synced rows from natural rows?
-  // what happens if two jobs run concurrently against the same shardId? Should an advisory lock be used to ensure only one job runs at a time? Or SELECT ... FOR UPDATE SKIP LOCKED?
+  const stats: ShardSyncStats = { processed: 0, skipped: 0, deleted: 0, errors: 0 };
+
+  for (let i = 0; i < maxIterations; i++) {
+    const count = await processOneBatch(shardId, batchSize, errorThreshold, maxAttempts, stats);
+    if (count === 0) {
+      break;
+    }
+    if (i < maxIterations - 1) {
+      await sleep(delayMs);
+    }
+  }
+
+  globalLogger.info('Shard sync complete', { shardId, stats });
+}
+
+interface OutboxRow {
+  id: string; // bigint comes as string from pg
+  resourceType: string;
+  resourceId: string;
+}
+
+interface DeduplicatedEntry {
+  resourceType: string;
+  resourceId: string;
+  outboxIds: string[];
+}
+
+/**
+ * Processes one batch of outbox rows from the shard.
+ * Claims rows with FOR UPDATE SKIP LOCKED, reads resource content from the shard,
+ * writes to global, and cleans up outbox rows.
+ * @param shardId - The shard to process.
+ * @param batchSize - Number of rows to claim per batch.
+ * @param errorThreshold - Consecutive global errors before aborting.
+ * @param maxAttempts - Max failed attempts before excluding a row.
+ * @param stats - Mutable stats accumulator.
+ * @returns The number of outbox rows claimed (0 = outbox is empty or fully locked).
+ */
+async function processOneBatch(
+  shardId: string,
+  batchSize: number,
+  errorThreshold: number,
+  maxAttempts: number,
+  stats: ShardSyncStats
+): Promise<number> {
+  const shardPool = getDatabasePool(DatabaseMode.WRITER, shardId);
+  const shardClient = await shardPool.connect();
+
+  try {
+    await shardClient.query('BEGIN');
+
+    // Claim batch with row-level locking (skip poison rows)
+    const { rows } = await shardClient.query<OutboxRow>(
+      `SELECT "id", "resourceType", "resourceId"
+       FROM "shard_sync_outbox"
+       WHERE "attempts" < $1
+       ORDER BY "id" ASC
+       LIMIT $2
+       FOR UPDATE SKIP LOCKED`,
+      [maxAttempts, batchSize]
+    );
+
+    if (rows.length === 0) {
+      await shardClient.query('COMMIT');
+      return 0;
+    }
+
+    // Deduplicate and group by resource type in one pass
+    const byType = new Map<string, Map<string, DeduplicatedEntry>>();
+    for (const row of rows) {
+      let typeMap = byType.get(row.resourceType);
+      if (!typeMap) {
+        typeMap = new Map();
+        byType.set(row.resourceType, typeMap);
+      }
+      const existing = typeMap.get(row.resourceId);
+      if (existing) {
+        existing.outboxIds.push(row.id);
+      } else {
+        typeMap.set(row.resourceId, {
+          resourceType: row.resourceType,
+          resourceId: row.resourceId,
+          outboxIds: [row.id],
+        });
+      }
+    }
+
+    const successfulOutboxIds: string[] = [];
+    const failedOutboxIds: string[] = [];
+    let consecutiveErrors = 0;
+
+    const globalRepo = getGlobalSystemRepo();
+
+    for (const [resourceType, entriesMap] of byType) {
+      const entries = Array.from(entriesMap.values());
+      const ids = entries.map((e) => e.resourceId);
+      const { rows: shardRows } = await shardClient.query<{ id: string; content: string; deleted: boolean }>(
+        `SELECT "id", "content", "deleted" FROM "${resourceType}" WHERE "id" = ANY($1)`,
+        [ids]
+      );
+
+      const contentMap = new Map<string, { content: string; deleted: boolean }>();
+      for (const row of shardRows) {
+        contentMap.set(row.id, row);
+      }
+
+      for (const entry of entries) {
+        const shardRow = contentMap.get(entry.resourceId);
+
+        if (!shardRow) {
+          // Resource deleted or missing — delete outbox rows, nothing to sync
+          successfulOutboxIds.push(...entry.outboxIds);
+          stats.skipped++;
+          continue;
+        }
+
+        if (shardRow.deleted) {
+          // Deleted on shard — delete outbox rows
+          // SHARDING: propagate deletion to global
+          successfulOutboxIds.push(...entry.outboxIds);
+          stats.deleted++;
+          continue;
+        }
+
+        const resource = JSON.parse(shardRow.content);
+
+        // Write to global with per-resource error handling
+        try {
+          await globalRepo.syncResourceFromShard(resource);
+          successfulOutboxIds.push(...entry.outboxIds);
+          stats.processed++;
+          consecutiveErrors = 0;
+        } catch (err) {
+          failedOutboxIds.push(...entry.outboxIds);
+          if (isSerializationError(err)) {
+            globalLogger.info('Serialization conflict during shard sync, will retry', {
+              resource: `${entry.resourceType}/${entry.resourceId}`,
+            });
+            stats.skipped++;
+            consecutiveErrors = 0;
+          } else {
+            globalLogger.error('Failed to sync resource to global', {
+              resource: `${entry.resourceType}/${entry.resourceId}`,
+              error: err,
+            });
+            stats.errors++;
+            consecutiveErrors++;
+            if (consecutiveErrors >= errorThreshold) {
+              // Global shard likely down — abort, rollback, let BullMQ retry
+              await shardClient.query('ROLLBACK');
+              throw new Error('Global shard unavailable: too many consecutive errors');
+            }
+          }
+        }
+      }
+    }
+
+    // Delete successful rows, increment attempts on failed rows
+    if (successfulOutboxIds.length > 0) {
+      await shardClient.query('DELETE FROM "shard_sync_outbox" WHERE "id" = ANY($1)', [successfulOutboxIds]);
+    }
+
+    if (failedOutboxIds.length > 0) {
+      await shardClient.query(
+        'UPDATE "shard_sync_outbox" SET "attempts" = "attempts" + 1, "lastAttemptAt" = NOW() WHERE "id" = ANY($1)',
+        [failedOutboxIds]
+      );
+    }
+
+    await shardClient.query('COMMIT');
+    return rows.length;
+  } catch (err) {
+    try {
+      await shardClient.query('ROLLBACK');
+    } catch {
+      // Ignore rollback errors
+    }
+    throw err;
+  } finally {
+    (shardClient as PoolClient).release();
+  }
+}
+
+/**
+ * Checks whether an error represents a serialization conflict that can safely be retried.
+ * @param err - The error to check.
+ * @returns True if the error is a serialization failure.
+ */
+function isSerializationError(err: unknown): boolean {
+  if (err instanceof OperationOutcomeError) {
+    return err.outcome.issue.some(
+      (i) => i.code === 'conflict' && i.details?.coding?.some((c) => c.code === PostgresError.SerializationFailure)
+    );
+  }
+  return false;
 }
 
 /**
@@ -91,12 +297,14 @@ async function addShardSyncJobData(jobData: ShardSyncJobData): Promise<Job<Shard
   if (!queue) {
     throw new Error(`Job queue ${queueName} not available`);
   }
-  return queue.add('ShardSyncJobData', jobData);
+  return queue.add('ShardSyncJobData', jobData, {
+    deduplication: { id: jobData.shardId },
+  });
 }
 
 export interface ShardSyncJobOptions {}
 
-export async function addReindexJob(shardId: string, options?: ShardSyncJobOptions): Promise<Job<ShardSyncJobData>> {
+export async function addShardSyncJob(shardId: string, options?: ShardSyncJobOptions): Promise<Job<ShardSyncJobData>> {
   const jobData = prepareShardSyncJobData(shardId, options);
   return addShardSyncJobData(jobData);
 }

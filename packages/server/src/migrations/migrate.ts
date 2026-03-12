@@ -763,6 +763,8 @@ function buildShardSyncOutboxTable(result: SchemaDefinition): void {
       { name: 'resourceType', type: 'TEXT', notNull: true },
       { name: 'resourceId', type: 'UUID', notNull: true },
       { name: 'resourceVersionId', type: 'UUID', notNull: true }, // may not be useful since we read from the resource table
+      { name: 'attempts', type: 'INTEGER', notNull: true, defaultValue: '0' },
+      { name: 'lastAttemptAt', type: 'TIMESTAMPTZ' },
     ],
     indexes: [
       // { columns: ['id'], indexType: 'btree' },

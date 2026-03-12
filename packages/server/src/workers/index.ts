@@ -10,6 +10,7 @@ import { addDownloadJobs, initDownloadWorker } from './download';
 import { initPostDeployMigrationWorker } from './post-deploy-migration';
 import { initReindexWorker } from './reindex';
 import { initSetAccountsWorker } from './set-accounts';
+import { initShardSyncWorker } from './shard-sync';
 import { addSubscriptionJobs, initSubscriptionWorker } from './subscription';
 import type { WorkerInitializer } from './utils';
 import { queueRegistry } from './utils';
@@ -22,6 +23,7 @@ const workerDefs: { name: WorkerName; init: WorkerInitializer }[] = [
   { name: 'batch', init: initBatchWorker },
   { name: 'post-deploy-migration', init: initPostDeployMigrationWorker },
   { name: 'set-accounts', init: initSetAccountsWorker },
+  { name: 'shard-sync', init: initShardSyncWorker },
 ];
 
 /**
