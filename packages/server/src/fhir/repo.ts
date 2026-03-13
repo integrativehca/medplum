@@ -3126,7 +3126,6 @@ function createSystemRepository(shardId: string, client?: ShardPoolClient): Syst
     // System repo does not have an associated Project since it can write to any,
     // but it still needs to be associated with a shard
     projects: undefined,
-    projectShardId: shardId,
   };
 
   return new SystemRepository(repoConfig, client);

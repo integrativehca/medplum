@@ -88,7 +88,7 @@ describe('FHIR Repo', () => {
     });
     systemRepo = await getProjectSystemRepo(testProject);
     testProjectRepo = new Repository({
-      projectShardId: testProjectShardId,
+      shardId: testProjectShardId,
       projects: [testProject],
       extendedMode: true,
       author: {
@@ -455,7 +455,7 @@ describe('FHIR Repo', () => {
       const author = 'Practitioner/' + randomUUID();
 
       const repo = new Repository({
-        projectShardId: testProjectShardId,
+        shardId: testProjectShardId,
         extendedMode: true,
         author: {
           reference: author,
@@ -476,7 +476,7 @@ describe('FHIR Repo', () => {
       const fakeAuthor = 'Practitioner/' + randomUUID();
 
       const repo = new Repository({
-        projectShardId: testProjectShardId,
+        shardId: testProjectShardId,
         extendedMode: true,
         author: {
           reference: author,
@@ -526,7 +526,7 @@ describe('FHIR Repo', () => {
       const author = 'Practitioner/' + randomUUID();
 
       const repo = new Repository({
-        projectShardId: testProjectShardId,
+        shardId: testProjectShardId,
         extendedMode: true,
         author: {
           reference: author,

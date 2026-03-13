@@ -149,7 +149,7 @@ export async function createTestProject<T extends StrictTestProjectOptions<T> = 
     if (options?.withRepo) {
       const repoContext: RepositoryContext = {
         projects: [project],
-        projectShardId,
+        shardId: projectShardId,
         currentProject: project,
         author: createReference(client),
         superAdmin: options?.superAdmin,

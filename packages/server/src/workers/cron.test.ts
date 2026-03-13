@@ -28,7 +28,7 @@ describe('Cron Worker', () => {
     const botProjectDetails = await createTestProject({ withClient: true });
     botProject = botProjectDetails.project;
     botRepo = new Repository({
-      projectShardId: botProjectDetails.projectShardId,
+      shardId: botProjectDetails.projectShardId,
       extendedMode: true,
       projects: [botProjectDetails.project],
       author: createReference(botProjectDetails.client),
@@ -178,7 +178,7 @@ describe('Cron Worker', () => {
       });
 
       const repo = new Repository({
-        projectShardId: systemRepo.shardId,
+        shardId: systemRepo.shardId,
         extendedMode: true,
         projects: [testProject],
         author: {

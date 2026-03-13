@@ -21,7 +21,7 @@ describe('Medplum Custom Search Parameters', () => {
   beforeEach(async () => {
     const { project, projectShardId } = await createTestProject();
     repo = new Repository({
-      projectShardId,
+      shardId: projectShardId,
       strictMode: true,
       projects: [project],
       author: { reference: 'User/' + randomUUID() },

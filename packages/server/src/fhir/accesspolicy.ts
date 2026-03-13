@@ -93,7 +93,7 @@ export async function getRepoForLogin(authState: AuthState, extendedMode?: boole
     checkReferencesOnWrite: project.checkReferencesOnWrite,
     validateTerminology: project.features?.includes('validate-terminology'),
     onBehalfOf: authState.onBehalfOf ? createReference(authState.onBehalfOf) : undefined,
-    projectShardId,
+    shardId: projectShardId,
   });
 }
 

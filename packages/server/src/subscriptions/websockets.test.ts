@@ -1940,7 +1940,7 @@ describe('Subscription Heartbeat', () => {
     accessToken = result.accessToken;
 
     repo = new Repository({
-      projectShardId: result.projectShardId,
+      shardId: result.projectShardId,
       extendedMode: true,
       projects: [project],
       author: {

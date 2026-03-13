@@ -43,7 +43,7 @@ describe('GraphQL', () => {
       projectShardId = aliceRegistration.projectShardId;
 
       const aliceRepo = new Repository({
-        projectShardId: projectShardId,
+        shardId: projectShardId,
         author: createReference(aliceRegistration.profile),
         projects: [aliceRegistration.project],
       });

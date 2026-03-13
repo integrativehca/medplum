@@ -97,7 +97,7 @@ describe('Subscription Worker', () => {
     repo = _repo;
     systemRepo = getShardSystemRepo(projectShardId);
     superAdminRepo = new Repository({
-      projectShardId,
+      shardId: projectShardId,
       extendedMode: true,
       superAdmin: true,
       author: createReference(client),
@@ -106,7 +106,7 @@ describe('Subscription Worker', () => {
     // Create another project, this one with bots enabled
     const botProjectDetails = await createTestProject({ withClient: true });
     botRepo = new Repository({
-      projectShardId,
+      shardId: projectShardId,
       extendedMode: true,
       projects: [botProjectDetails.project],
       author: createReference(botProjectDetails.client),
