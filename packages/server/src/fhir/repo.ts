@@ -1447,6 +1447,9 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
           await this.deleteFromLookupTables(conn, resource);
           if (this.shardId !== GLOBAL_SHARD_ID && SyncedResourceTypes.has(resourceType)) {
             await this.writeShardSyncOutbox(conn, resource, versionId);
+            await this.postCommit(async () => {
+              await addShardSyncJob(this.shardId);
+            });
           }
           const durationMs = Date.now() - startTime;
 

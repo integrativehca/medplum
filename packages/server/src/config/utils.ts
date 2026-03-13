@@ -93,6 +93,8 @@ export function addDefaults(config: MedplumServerConfig): ServerConfig {
   for (const [shardId, shardConfig] of Object.entries(config.shards)) {
     shardConfig.id = shardId;
   }
+  // SHARDING - need better management of this flag.
+  config.enableSharding = Object.keys(config.shards ?? {}).length > 1;
   return config as ServerConfig;
 }
 

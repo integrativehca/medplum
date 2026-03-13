@@ -951,6 +951,7 @@ export async function getLoginForAccessToken(
     return undefined;
   }
   const { project, projectShardId } = await getProjectAndProjectShardId(membership.project);
+  getLogger().info('getLoginForAccessToken', { projectId: project.id, shardId: projectShardId });
   const userConfig = await getUserConfiguration(getShardSystemRepo(projectShardId), project, membership);
   const authState = { login, project, projectShardId, membership, userConfig, accessToken };
   await tryAddOnBehalfOf(req, authState);

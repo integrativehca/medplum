@@ -13,7 +13,7 @@ function write(msg: string): void {
   process.stdout.write(msg + '\n');
 }
 
-export const systemLogger = new Logger(write, undefined, LogLevel.ERROR);
+export const systemLogger = new Logger(write, undefined, LogLevel.INFO);
 
 /**
  * @returns the current `IRequestContext.logger` if available, otherwise `systemLogger`

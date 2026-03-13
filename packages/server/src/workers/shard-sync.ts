@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { OperationOutcomeError, sleep } from '@medplum/core';
 import type { ResourceType } from '@medplum/fhirtypes';
-import type { Job, QueueBaseOptions } from 'bullmq';
+import type { Job, JobsOptions, QueueBaseOptions } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
 import { getConfig } from '../config/loader';
 import { tryGetRequestContext, tryRunInRequestContext } from '../context';
 import { getGlobalSystemRepo, getShardSystemRepo } from '../fhir/repo';
 import { GLOBAL_SHARD_ID } from '../fhir/sharding';
-import { isRetryableTransactionError } from '../fhir/sql';
+import { isRetryableTransactionError, SqlBuilder } from '../fhir/sql';
 import { globalLogger } from '../logger';
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
 import { addVerboseQueueLogging, getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry } from './utils';
@@ -148,14 +148,11 @@ async function processOneBatch(
 
   return shardRepo.withTransaction(async (shardClient) => {
     // Claim batch with row-level locking (simple scan; poison rows moved to deadletter on failure)
-    const { rows } = await shardClient.query<OutboxRow>(
-      `SELECT "id", "resourceType", "resourceId", "resourceVersionId"
-       FROM "shard_sync_outbox"
-       ORDER BY "id" ASC
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED`,
+    const builder = new SqlBuilder(
+      'SELECT "id", "resourceType", "resourceId", "resourceVersionId" FROM "shard_sync_outbox" ORDER BY "id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED',
       [batchSize]
     );
+    const { rows } = await builder.execute<OutboxRow>(shardClient);
 
     if (rows.length === 0) {
       return 0;
@@ -192,7 +189,7 @@ async function processOneBatch(
     for (const [resourceType, entriesMap] of entriesByType) {
       const entries = Array.from(entriesMap.values());
       const ids = entries.map((e) => e.resourceId);
-      const { rows: shardRows } = await shardClient.query<ShardResourceRow>(
+      const builder = new SqlBuilder(
         `SELECT DISTINCT ON (r.id)
           r."id", r."content", r."deleted", r."projectId", r."compartments", r."lastUpdated",
           h."versionId", h."content" as "historyContent"
@@ -200,6 +197,7 @@ async function processOneBatch(
           WHERE r.id = ANY($1) ORDER BY r.id, h."lastUpdated" DESC`,
         [ids]
       );
+      const { rows: shardRows } = await builder.execute<ShardResourceRow>(shardClient);
 
       const contentMap = new Map<string, ShardResourceRow>();
       for (const row of shardRows) {
@@ -307,22 +305,24 @@ async function processOneBatch(
 
     // Delete successful rows (and their attempt records)
     if (successfulOutboxIds.length > 0) {
-      await shardClient.query('DELETE FROM "shard_sync_outbox_attempts" WHERE "outbox_id" = ANY($1)', [
+      await new SqlBuilder('DELETE FROM "shard_sync_outbox_attempts" WHERE "outbox_id" = ANY($1)', [
         successfulOutboxIds,
-      ]);
-      await shardClient.query('DELETE FROM "shard_sync_outbox" WHERE "id" = ANY($1)', [successfulOutboxIds]);
+      ]).execute(shardClient);
+      await new SqlBuilder('DELETE FROM "shard_sync_outbox" WHERE "id" = ANY($1)', [successfulOutboxIds]).execute(
+        shardClient
+      );
     }
 
     // Record attempts for failed rows; move poison rows (exceeded maxAttempts) to deadletter
     if (failedOutboxIds.length > 0) {
-      await shardClient.query(
+      await new SqlBuilder(
         `INSERT INTO "shard_sync_outbox_attempts" ("outbox_id", "attemptedAt")
          SELECT unnest($1::bigint[]), NOW()`,
         [failedOutboxIds]
-      );
+      ).execute(shardClient);
 
       // Move rows that have exceeded maxAttempts to deadletter (INSERT...SELECT in one query)
-      const { rows: movedRows } = await shardClient.query<{ outbox_id: string }>(
+      const { rows: movedRows } = await new SqlBuilder(
         `INSERT INTO "shard_sync_outbox_deadletter" ("outbox_id", "resourceType", "resourceId", "resourceVersionId", "movedAt")
          SELECT o."id", o."resourceType", o."resourceId", o."resourceVersionId", NOW()
          FROM "shard_sync_outbox" o
@@ -334,11 +334,13 @@ async function processOneBatch(
          )
          RETURNING "outbox_id"`,
         [failedOutboxIds, maxAttempts]
-      );
+      ).execute<{ outbox_id: string }>(shardClient);
       const poisonedOutboxIds = movedRows.map((r) => r.outbox_id);
       if (poisonedOutboxIds.length > 0) {
         stats.deadletter += poisonedOutboxIds.length;
-        await shardClient.query('DELETE FROM "shard_sync_outbox" WHERE "id" = ANY($1)', [poisonedOutboxIds]);
+        await new SqlBuilder('DELETE FROM "shard_sync_outbox" WHERE "id" IN ($1)', [poisonedOutboxIds]).execute(
+          shardClient
+        );
       }
     }
 
@@ -355,13 +357,14 @@ export function getShardSyncQueue(): Queue<ShardSyncJobData> | undefined {
   return queueRegistry.get(queueName);
 }
 
-async function addShardSyncJobData(jobData: ShardSyncJobData): Promise<Job<ShardSyncJobData>> {
+async function addShardSyncJobData(jobData: ShardSyncJobData, opts?: JobsOptions): Promise<Job<ShardSyncJobData>> {
   const queue = getShardSyncQueue();
   if (!queue) {
     throw new Error(`Job queue ${queueName} not available`);
   }
   return queue.add('ShardSyncJobData', jobData, {
     deduplication: { id: jobData.shardId },
+    ...opts,
   });
 }
 
@@ -369,7 +372,7 @@ export interface ShardSyncJobOptions {}
 
 export async function addShardSyncJob(shardId: string, options?: ShardSyncJobOptions): Promise<Job<ShardSyncJobData>> {
   const jobData = prepareShardSyncJobData(shardId, options);
-  return addShardSyncJobData(jobData);
+  return addShardSyncJobData(jobData, { delay: 2000 });
 }
 
 export function prepareShardSyncJobData(shardId: string, _options?: ShardSyncJobOptions): ShardSyncJobData {

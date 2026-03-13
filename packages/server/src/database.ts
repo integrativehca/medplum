@@ -31,11 +31,6 @@ const globalPools: { pool: ShardPool | undefined; readonlyPool: ShardPool | unde
 const shardPools: Record<string, { pool: ShardPool | undefined; readonlyPool: ShardPool | undefined }> = {};
 
 export function getDatabasePool(mode: DatabaseMode, shardId: string): ShardPool {
-  if (shardId.startsWith('TODO')) {
-    console.warn(`getDatabasePool called with shardId ${shardId}`);
-    shardId = GLOBAL_SHARD_ID;
-  }
-
   const pools = shardId && shardId !== GLOBAL_SHARD_ID ? shardPools[shardId] : globalPools;
 
   if (!pools.pool) {

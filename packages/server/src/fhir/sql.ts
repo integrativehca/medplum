@@ -10,7 +10,7 @@ import {
 } from '@medplum/core';
 import type { Period } from '@medplum/fhirtypes';
 import { env } from 'node:process';
-import type { Client, Pool, PoolClient } from 'pg';
+import type { Client, Pool, PoolClient, QueryResultRow } from 'pg';
 import { getLogger } from '../logger';
 import type { ShardPool, ShardPoolClient } from '../sharding/sharding-types';
 import type { ColumnSearchParameterImplementation } from './searchparameter';
@@ -505,9 +505,9 @@ export class SqlBuilder {
   private readonly values: any[];
   debug = DEBUG;
 
-  constructor() {
-    this.sql = [];
-    this.values = [];
+  constructor(sql?: string, values?: any[]) {
+    this.sql = sql ? [sql] : [];
+    this.values = values ? [...values] : [];
   }
 
   append(value: any): this {
@@ -592,9 +592,15 @@ export class SqlBuilder {
     return this.values;
   }
 
-  async execute(
+  // raw(sql: string, values: any[]): this {
+  //   this.sql.push(sql);
+  //   this.values.push(...values);
+  //   return this;
+  // }
+
+  async execute<R extends QueryResultRow = any>(
     conn: Client | Pool | PoolClient | ShardPoolClient | ShardPool
-  ): Promise<{ rowCount: number; rows: any[] }> {
+  ): Promise<{ rowCount: number; rows: R[] }> {
     const sql = this.toString();
     let startTime = 0;
     let debugPrefix = '';
@@ -609,7 +615,7 @@ export class SqlBuilder {
       startTime = Date.now();
     }
     try {
-      const result = await conn.query(sql, this.values);
+      const result = await conn.query<R>(sql, this.values);
       if (this.debug) {
         const endTime = Date.now();
         const duration = endTime - startTime;
