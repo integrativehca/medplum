@@ -3,11 +3,9 @@
 import { OperationOutcomeError, sleep } from '@medplum/core';
 import type { Job, QueueBaseOptions } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
-import type { PoolClient } from 'pg';
 import { getConfig } from '../config/loader';
 import { tryGetRequestContext, tryRunInRequestContext } from '../context';
-import { DatabaseMode, getDatabasePool } from '../database';
-import { getGlobalSystemRepo } from '../fhir/repo';
+import { getGlobalSystemRepo, getShardSystemRepo } from '../fhir/repo';
 import { GLOBAL_SHARD_ID } from '../fhir/sharding';
 import { isRetryableTransactionError } from '../fhir/sql';
 import { globalLogger } from '../logger';
@@ -132,12 +130,9 @@ async function processOneBatch(
   maxAttempts: number,
   stats: ShardSyncStats
 ): Promise<number> {
-  const shardPool = getDatabasePool(DatabaseMode.WRITER, shardId);
-  const shardClient = await shardPool.connect();
+  const shardRepo = getShardSystemRepo(shardId);
 
-  try {
-    await shardClient.query('BEGIN');
-
+  return shardRepo.withTransaction(async (shardClient) => {
     // Claim batch with row-level locking (simple scan; poison rows moved to deadletter on failure)
     const { rows } = await shardClient.query<OutboxRow>(
       `SELECT "id", "resourceType", "resourceId"
@@ -149,7 +144,6 @@ async function processOneBatch(
     );
 
     if (rows.length === 0) {
-      await shardClient.query('COMMIT');
       return 0;
     }
 
@@ -234,8 +228,7 @@ async function processOneBatch(
             stats.errors++;
             consecutiveErrors++;
             if (consecutiveErrors >= errorThreshold) {
-              // Global shard likely down — abort, rollback, let BullMQ retry
-              await shardClient.query('ROLLBACK');
+              // Global shard likely down — abort, let BullMQ retry (withTransaction will rollback)
               throw new Error('Global shard unavailable: too many consecutive errors');
             }
           }
@@ -280,18 +273,8 @@ async function processOneBatch(
       }
     }
 
-    await shardClient.query('COMMIT');
     return rows.length;
-  } catch (err) {
-    try {
-      await shardClient.query('ROLLBACK');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
-  } finally {
-    (shardClient as PoolClient).release();
-  }
+  });
 }
 
 /**
