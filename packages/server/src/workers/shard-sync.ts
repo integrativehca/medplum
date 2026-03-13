@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { OperationOutcomeError, sleep } from '@medplum/core';
+import type { ResourceType } from '@medplum/fhirtypes';
 import type { Job, QueueBaseOptions } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
 import { getConfig } from '../config/loader';
@@ -102,12 +103,25 @@ export async function execShardSyncJob(job: Job<ShardSyncJobData>): Promise<void
 
 interface OutboxRow {
   id: string; // bigint comes as string from pg
-  resourceType: string;
+  resourceType: ResourceType;
   resourceId: string;
+  resourceVersionId: string;
+}
+
+interface ShardResourceRow {
+  id: string;
+  content: string;
+  deleted: boolean;
+  projectId: string;
+  compartments: string[];
+  lastUpdated: Date;
+  // history columns
+  versionId: string | null;
+  historyContent: string | null;
 }
 
 interface DeduplicatedEntry {
-  resourceType: string;
+  resourceType: ResourceType;
   resourceId: string;
   outboxIds: string[];
 }
@@ -135,7 +149,7 @@ async function processOneBatch(
   return shardRepo.withTransaction(async (shardClient) => {
     // Claim batch with row-level locking (simple scan; poison rows moved to deadletter on failure)
     const { rows } = await shardClient.query<OutboxRow>(
-      `SELECT "id", "resourceType", "resourceId"
+      `SELECT "id", "resourceType", "resourceId", "resourceVersionId"
        FROM "shard_sync_outbox"
        ORDER BY "id" ASC
        LIMIT $1
@@ -147,19 +161,21 @@ async function processOneBatch(
       return 0;
     }
 
-    // Deduplicate and group by resource type in one pass
-    const byType = new Map<string, Map<string, DeduplicatedEntry>>();
+    const entriesByType = new Map<string, Map<string, DeduplicatedEntry>>();
     for (const row of rows) {
-      let typeMap = byType.get(row.resourceType);
-      if (!typeMap) {
-        typeMap = new Map();
-        byType.set(row.resourceType, typeMap);
+      // Group by resource type
+      let entriesById = entriesByType.get(row.resourceType);
+      if (!entriesById) {
+        entriesById = new Map();
+        entriesByType.set(row.resourceType, entriesById);
       }
-      const existing = typeMap.get(row.resourceId);
-      if (existing) {
-        existing.outboxIds.push(row.id);
+
+      // Group by resource ID
+      const entries = entriesById.get(row.resourceId);
+      if (entries) {
+        entries.outboxIds.push(row.id);
       } else {
-        typeMap.set(row.resourceId, {
+        entriesById.set(row.resourceId, {
           resourceType: row.resourceType,
           resourceId: row.resourceId,
           outboxIds: [row.id],
@@ -173,15 +189,19 @@ async function processOneBatch(
 
     const globalRepo = getGlobalSystemRepo();
 
-    for (const [resourceType, entriesMap] of byType) {
+    for (const [resourceType, entriesMap] of entriesByType) {
       const entries = Array.from(entriesMap.values());
       const ids = entries.map((e) => e.resourceId);
-      const { rows: shardRows } = await shardClient.query<{ id: string; content: string; deleted: boolean }>(
-        `SELECT "id", "content", "deleted" FROM "${resourceType}" WHERE "id" = ANY($1)`,
+      const { rows: shardRows } = await shardClient.query<ShardResourceRow>(
+        `SELECT DISTINCT ON (r.id)
+          r."id", r."content", r."deleted", r."projectId", r."compartments", r."lastUpdated",
+          h."versionId", h."content" as "historyContent"
+          FROM "${resourceType}" as r JOIN "${resourceType}_History" as h ON r.id = h.id
+          WHERE r.id = ANY($1) ORDER BY r.id, h."lastUpdated" DESC`,
         [ids]
       );
 
-      const contentMap = new Map<string, { content: string; deleted: boolean }>();
+      const contentMap = new Map<string, ShardResourceRow>();
       for (const row of shardRows) {
         contentMap.set(row.id, row);
       }
@@ -196,11 +216,60 @@ async function processOneBatch(
           continue;
         }
 
+        if (shardRow.content !== shardRow.historyContent) {
+          globalLogger.error('Content mismatch between resource and history', {
+            resource: `${entry.resourceType}/${entry.resourceId}`,
+            content: shardRow.content,
+            historyContent: shardRow.historyContent,
+          });
+          stats.errors++;
+          consecutiveErrors++;
+          continue;
+        }
+
         if (shardRow.deleted) {
-          // Deleted on shard — delete outbox rows
-          // SHARDING: propagate deletion to global
-          successfulOutboxIds.push(...entry.outboxIds);
-          stats.deleted++;
+          // Deleted on shard — propagate deletion to global
+          if (!shardRow.versionId) {
+            globalLogger.error('No version ID found for deleted resource', {
+              resource: `${entry.resourceType}/${entry.resourceId}`,
+            });
+            stats.errors++;
+            consecutiveErrors++;
+            continue;
+          }
+
+          try {
+            await globalRepo.syncDeleteFromShard(
+              entry.resourceType,
+              entry.resourceId,
+              shardRow.lastUpdated,
+              shardRow.projectId,
+              shardRow.compartments,
+              shardRow.versionId
+            );
+            successfulOutboxIds.push(...entry.outboxIds);
+            stats.deleted++;
+            consecutiveErrors = 0;
+          } catch (err) {
+            failedOutboxIds.push(...entry.outboxIds);
+            if (err instanceof OperationOutcomeError && isRetryableTransactionError(err)) {
+              globalLogger.info('Serialization conflict during shard sync delete, will retry', {
+                resource: `${entry.resourceType}/${entry.resourceId}`,
+              });
+              stats.skipped++;
+              consecutiveErrors = 0;
+            } else {
+              globalLogger.error('Failed to sync delete to global', {
+                resource: `${entry.resourceType}/${entry.resourceId}`,
+                error: err,
+              });
+              stats.errors++;
+              consecutiveErrors++;
+              if (consecutiveErrors >= errorThreshold) {
+                throw new Error('Global shard unavailable: too many consecutive errors');
+              }
+            }
+          }
           continue;
         }
 
